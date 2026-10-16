@@ -2,13 +2,12 @@
 import streamlit as st
 import requests
 import pandas as pd
-from datetime import date, datetime, timedelta, timezone
-from collections import Counter
+from datetime import date, timedelta, datetime
+from collections import defaultdict
 
 # =========================================================
-# CANCHALAB IA - MATCHGRIND
-# Datos reales de partidos, resultados y forma reciente.
-# No requiere API key según la documentación pública.
+# CANCHALAB IA - Aplicación de análisis futbolístico
+# Fuente de datos: MatchGrind Football API
 # =========================================================
 
 st.set_page_config(
@@ -20,155 +19,253 @@ st.set_page_config(
 BASE_URL = "https://www.matchgrind.space/get/soccer"
 TIMEOUT = 20
 
-LIGAS = {
-    "Premier League (Inglaterra)": "eng.1",
-    "Championship (Inglaterra)": "eng.2",
-    "La Liga (España)": "esp.1",
-    "Segunda División (España)": "esp.2",
-    "Bundesliga (Alemania)": "ger.1",
-    "2. Bundesliga (Alemania)": "ger.2",
-    "Serie A (Italia)": "ita.1",
-    "Serie B (Italia)": "ita.2",
-    "Ligue 1 (Francia)": "fra.1",
-    "Ligue 2 (Francia)": "fra.2",
-    "Eredivisie (Países Bajos)": "ned.1",
-    "Primeira Liga (Portugal)": "por.1",
-    "Scottish Premiership": "sco.1",
-    "Belgian Pro League": "bel.1",
-    "Turkish Super Lig": "tur.1",
-    "Champions League": "uefa.champions",
-    "Europa League": "uefa.europa",
-    "Conference League": "uefa.europa.conf",
-    "MLS (Estados Unidos)": "usa.1",
-    "Liga MX (México)": "mex.1",
-    "Brasileirão (Brasil)": "bra.1",
-    "Liga Profesional (Argentina)": "arg.1",
-    "Copa Libertadores": "conmebol.libertadores",
-    "Copa Sudamericana": "conmebol.sudamericana",
-    "Saudi Pro League": "ksa.1",
-    "J1 League (Japón)": "jpn.1",
-    "A-League (Australia)": "aus.1",
-    "FA Cup (Inglaterra)": "eng.fa",
-    "Copa del Rey (España)": "esp.copa_del_rey",
-    "DFB-Pokal (Alemania)": "ger.dfb_pokal",
-    "Coppa Italia": "ita.coppa_italia",
-    "Women's Super League": "eng.w.1",
-    # Esta competición puede no estar disponible en MatchGrind.
-    "Primera División de Chile (probar cobertura)": "chi.1",
-}
+st.markdown(
+    """
+    <style>
+    .block-container {
+        padding-top: 1.5rem;
+        padding-bottom: 3rem;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+st.title("⚽ CanchaLab IA")
+st.caption(
+    "Análisis de partidos, resultados y forma reciente. "
+    "Los datos dependen de la cobertura de la API."
+)
 
 
-# -------------------- API --------------------
+# =========================================================
+# FUNCIONES PARA CONSULTAR LA API
+# =========================================================
 
-def llamar_api(endpoint, params=None):
+def consultar_api(endpoint, params=None):
+    """Consulta la API y devuelve el JSON recibido."""
     url = f"{BASE_URL}/{endpoint.lstrip('/')}"
 
-    try:
-        response = requests.get(
-            url,
-            params=params or {},
-            headers={
-                "Accept": "application/json",
-                "User-Agent": "CanchaLabIA/1.0",
-            },
-            timeout=TIMEOUT,
-        )
-    except requests.RequestException as exc:
-        raise RuntimeError(
-            f"No se pudo conectar con MatchGrind: {exc}"
-        ) from exc
+    respuesta = requests.get(
+        url,
+        params=params or {},
+        timeout=TIMEOUT,
+        headers={"Accept": "application/json"},
+    )
 
-    if response.status_code == 404:
-        raise RuntimeError(
-            "El endpoint o la competición no están disponibles "
-            "en esta dirección."
-        )
-
-    if response.status_code == 429:
-        raise RuntimeError(
-            "MatchGrind limitó temporalmente las consultas. "
-            "Espera un momento y vuelve a probar."
-        )
-
-    if not response.ok:
-        raise RuntimeError(
-            f"MatchGrind devolvió HTTP {response.status_code}: "
-            f"{response.text[:250]}"
-        )
+    respuesta.raise_for_status()
 
     try:
-        return response.json()
+        return respuesta.json()
     except ValueError as exc:
-        raise RuntimeError(
-            "La respuesta recibida no contiene JSON válido."
+        raise ValueError(
+            f"La API no devolvió JSON válido. URL: {respuesta.url}"
         ) from exc
 
 
-def extraer_lista(payload):
-    """Admite listas directas y envoltorios JSON comunes."""
-    if isinstance(payload, list):
-        return payload
-
-    if not isinstance(payload, dict):
+def buscar_lista_partidos(objeto, profundidad=0):
+    """
+    Busca listas de partidos en distintas estructuras JSON.
+    Admite respuestas como:
+    - una lista directa
+    - {'data': [...]}
+    - {'events': [...]}
+    - {'fixtures': [...]}
+    - {'matches': [...]}
+    """
+    if profundidad > 6:
         return []
 
-    for key in ("events", "matches", "fixtures", "data", "items", "results"):
-        value = payload.get(key)
+    if isinstance(objeto, list):
+        if not objeto:
+            return []
 
-        if isinstance(value, list):
-            return value
+        diccionarios = [
+            elemento for elemento in objeto
+            if isinstance(elemento, dict)
+        ]
 
-        if isinstance(value, dict):
-            nested = extraer_lista(value)
-            if nested:
-                return nested
+        if diccionarios and any(
+            any(
+                clave in elemento
+                for clave in (
+                    "homeTeam", "awayTeam", "home", "away",
+                    "competitors", "teams", "date", "status",
+                    "home_team", "away_team",
+                )
+            )
+            for elemento in diccionarios
+        ):
+            return diccionarios
 
-    # Algunos servicios devuelven un evento individual.
-    if (
-        "competitions" in payload
-        or "homeTeam" in payload
-        or "home_team" in payload
-    ):
-        return [payload]
+        for elemento in objeto:
+            resultado = buscar_lista_partidos(
+                elemento, profundidad + 1
+            )
+            if resultado:
+                return resultado
+
+        return []
+
+    if isinstance(objeto, dict):
+        claves_preferidas = [
+            "matches", "fixtures", "events",
+            "results", "data", "items", "response",
+            "games", "schedule",
+        ]
+
+        for clave in claves_preferidas:
+            if clave in objeto:
+                resultado = buscar_lista_partidos(
+                    objeto[clave], profundidad + 1
+                )
+                if resultado:
+                    return resultado
+
+        for valor in objeto.values():
+            if isinstance(valor, (dict, list)):
+                resultado = buscar_lista_partidos(
+                    valor, profundidad + 1
+                )
+                if resultado:
+                    return resultado
 
     return []
 
 
-@st.cache_data(ttl=900, show_spinner=False)
-def cargar_fixtures(slug):
-    # Documentación pública: /get/soccer/{liga}/fixtures?status=all
-    payload = llamar_api(f"{slug}/fixtures", {"status": "all"})
-    return extraer_lista(payload)
+def primer_valor(diccionario, claves, predeterminado=None):
+    """Devuelve el primer valor existente entre varias claves."""
+    if not isinstance(diccionario, dict):
+        return predeterminado
+
+    for clave in claves:
+        valor = diccionario.get(clave)
+        if valor is not None and valor != "":
+            return valor
+
+    return predeterminado
 
 
-@st.cache_data(ttl=300, show_spinner=False)
-def cargar_marcador_fecha(slug, fecha_yyyymmdd):
-    # Documentación pública: /get/soccer/{liga}/scoreboard?dates=YYYYMMDD
-    payload = llamar_api(
-        f"{slug}/scoreboard",
-        {"dates": fecha_yyyymmdd},
+def nombre_equipo(objeto):
+    """Extrae el nombre de un equipo desde formatos comunes."""
+    if isinstance(objeto, str):
+        return objeto
+
+    if isinstance(objeto, dict):
+        valor = primer_valor(
+            objeto,
+            ["displayName", "name", "shortName", "teamName", "title"],
+        )
+        if valor is not None:
+            return str(valor)
+
+    return None
+
+
+def extraer_equipos(partido):
+    """Encuentra los equipos local y visitante."""
+    local = primer_valor(
+        partido,
+        ["homeTeam", "home_team", "home", "local", "teamHome"],
     )
-    return extraer_lista(payload)
+    visitante = primer_valor(
+        partido,
+        ["awayTeam", "away_team", "away", "visitor", "teamAway"],
+    )
+
+    if isinstance(partido.get("competitors"), list):
+        competidores = partido["competitors"]
+
+        for equipo in competidores:
+            if not isinstance(equipo, dict):
+                continue
+
+            lado = str(
+                primer_valor(
+                    equipo,
+                    ["homeAway", "qualifier", "side", "location"],
+                    "",
+                )
+            ).lower()
+
+            if lado in ("home", "local", "home team"):
+                local = equipo
+            elif lado in ("away", "visitor", "away team", "visiting"):
+                visitante = equipo
+
+    if isinstance(partido.get("teams"), list):
+        equipos = partido["teams"]
+
+        if len(equipos) >= 2 and not local and not visitante:
+            local, visitante = equipos[0], equipos[1]
+
+    return nombre_equipo(local), nombre_equipo(visitante)
 
 
-# -------------------- NORMALIZACIÓN --------------------
+def extraer_goles(partido):
+    """Extrae los goles desde distintas estructuras posibles."""
+    local = None
+    visitante = None
 
-def primer_valor(obj, keys, default=None):
-    if not isinstance(obj, dict):
-        return default
+    marcador = partido.get("score")
 
-    for key in keys:
-        value = obj.get(key)
-        if value is not None and value != "":
-            return value
+    if isinstance(marcador, dict):
+        local = primer_valor(
+            marcador,
+            ["home", "homeScore", "home_score", "local"],
+        )
+        visitante = primer_valor(
+            marcador,
+            ["away", "awayScore", "away_score", "visitor"],
+        )
 
-    return default
+    home_obj = primer_valor(
+        partido, ["homeTeam", "home_team", "home", "local"]
+    )
+    away_obj = primer_valor(
+        partido, ["awayTeam", "away_team", "away", "visitor"]
+    )
+
+    if local is None and isinstance(home_obj, dict):
+        local = primer_valor(
+            home_obj, ["score", "goals", "scoreValue"]
+        )
+
+    if visitante is None and isinstance(away_obj, dict):
+        visitante = primer_valor(
+            away_obj, ["score", "goals", "scoreValue"]
+        )
+
+    if local is None:
+        local = primer_valor(
+            partido,
+            ["homeScore", "home_score", "scoreHome", "localScore"],
+        )
+
+    if visitante is None:
+        visitante = primer_valor(
+            partido,
+            ["awayScore", "away_score", "scoreAway", "visitorScore"],
+        )
+
+    def convertir(valor):
+        if valor is None or valor == "":
+            return None
+        try:
+            return int(valor)
+        except (ValueError, TypeError):
+            return None
+
+    return convertir(local), convertir(visitante)
 
 
-def fecha_utc(partido):
+def extraer_fecha(partido):
     valor = primer_valor(
         partido,
-        ("date", "utcDate", "startDate", "kickoff", "dateUtc"),
+        [
+            "date", "startDate", "startTime", "kickoff",
+            "kickoffTime", "utcDate", "timestamp",
+        ],
     )
 
     if valor is None:
@@ -176,660 +273,656 @@ def fecha_utc(partido):
 
     try:
         if isinstance(valor, (int, float)):
-            return datetime.fromtimestamp(valor, tz=timezone.utc)
+            # Algunas API entregan timestamps en milisegundos.
+            if valor > 10_000_000_000:
+                valor = valor / 1000
+            return datetime.fromtimestamp(valor).date()
 
-        texto = str(valor).replace("Z", "+00:00")
-        dt = datetime.fromisoformat(texto)
+        texto = str(valor).strip()
 
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
+        if texto.isdigit():
+            numero = int(texto)
+            if numero > 10_000_000_000:
+                numero = numero / 1000
+            return datetime.fromtimestamp(numero).date()
 
-        return dt.astimezone(timezone.utc)
-    except (ValueError, TypeError, OverflowError):
+        return date.fromisoformat(texto[:10])
+
+    except (ValueError, TypeError, OverflowError, OSError):
         return None
 
 
-def equipos_partido(partido):
-    # Formato tipo ESPN: competitions -> competitors
-    competitions = partido.get("competitions", [])
-    if competitions and isinstance(competitions[0], dict):
-        competitors = competitions[0].get("competitors", [])
-
-        local = next(
-            (x for x in competitors if x.get("homeAway") == "home"),
-            None,
-        )
-        visita = next(
-            (x for x in competitors if x.get("homeAway") == "away"),
-            None,
-        )
-
-        if local and visita:
-            return local, visita
-
-    # Formatos alternativos
-    local = primer_valor(
-        partido, ("homeTeam", "home_team", "home", "local"), {}
-    )
-    visita = primer_valor(
-        partido, ("awayTeam", "away_team", "away", "visitante"), {}
+def extraer_estado(partido):
+    estado = primer_valor(
+        partido,
+        ["status", "state", "matchStatus", "statusName"],
+        "Sin información",
     )
 
-    if isinstance(local, str):
-        local = {"name": local}
-    if isinstance(visita, str):
-        visita = {"name": visita}
-
-    return local or {}, visita or {}
-
-
-def nombre_equipo(equipo):
-    if isinstance(equipo, str):
-        return equipo
-
-    return str(
-        primer_valor(
-            equipo,
-            ("displayName", "name", "shortName", "team_name", "abbreviation"),
-            "Equipo desconocido",
+    if isinstance(estado, dict):
+        estado = primer_valor(
+            estado,
+            ["description", "name", "detail", "type", "shortName"],
+            "Sin información",
         )
-    )
+
+    return str(estado)
 
 
-def id_equipo(equipo):
-    if not isinstance(equipo, dict):
-        return None
-    return primer_valor(equipo, ("id", "teamId", "team_id"))
+def normalizar_partido(partido, liga_nombre):
+    local, visitante = extraer_equipos(partido)
 
-
-def obtener_marcador(equipo):
-    if not isinstance(equipo, dict):
+    if not local or not visitante:
         return None
 
-    score = primer_valor(equipo, ("score", "goals", "total"))
-    if score is None:
-        return None
+    goles_local, goles_visitante = extraer_goles(partido)
+    fecha_partido = extraer_fecha(partido)
+    estado = extraer_estado(partido)
+
+    return {
+        "Fecha": fecha_partido,
+        "Competición": liga_nombre,
+        "Local": local,
+        "Visitante": visitante,
+        "Goles local": goles_local,
+        "Goles visitante": goles_visitante,
+        "Estado": estado,
+        "_original": partido,
+    }
+
+
+# =========================================================
+# CATÁLOGO DE COMPETICIONES
+# =========================================================
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def cargar_ligas():
+    """
+    Intenta cargar las competiciones disponibles desde la API.
+    Si falla el catálogo, utiliza una lista de respaldo.
+    """
+    respaldo = [
+        {"slug": "eng.1", "name": "Premier League"},
+        {"slug": "esp.1", "name": "LaLiga"},
+        {"slug": "ger.1", "name": "Bundesliga"},
+        {"slug": "ita.1", "name": "Serie A"},
+        {"slug": "fra.1", "name": "Ligue 1"},
+        {"slug": "uefa.champions", "name": "Champions League"},
+        {"slug": "conmebol.libertadores", "name": "Copa Libertadores"},
+        {"slug": "chi.1", "name": "Primera División de Chile"},
+    ]
 
     try:
-        return int(float(score))
-    except (ValueError, TypeError):
-        return None
-
-
-def estado_partido(partido):
-    status = partido.get("status", {})
-
-    if isinstance(status, dict):
-        estado = primer_valor(
-            status,
-            ("type", "name", "state", "description", "detail"),
-            "",
+        payload = consultar_api(
+            "leagues",
+            {"kind": "club", "available": "true"},
         )
-        if isinstance(estado, dict):
-            estado = primer_valor(estado, ("name", "description"), "")
-    else:
-        estado = status
 
-    estado = str(estado).strip().lower()
+        registros = []
 
-    # Valores típicos de feeds deportivos.
-    finalizados = (
-        "final", "finished", "complete", "completed",
-        "full time", "ft", "aet", "after penalties",
-        "terminado", "finalizado", "awarded",
-    )
-    en_juego = (
-        "in progress", "in_progress", "live", "halftime",
-        "half time", "1h", "2h", "first half", "second half",
-    )
-    cancelados = ("cancel", "postpon", "abandon", "suspend")
+        def recorrer(objeto):
+            if isinstance(objeto, list):
+                for elemento in objeto:
+                    recorrer(elemento)
 
-    if any(x in estado for x in finalizados):
-        return "FINAL"
-    if any(x in estado for x in en_juego):
-        return "EN JUEGO"
-    if any(x in estado for x in cancelados):
-        return "NO DISPONIBLE"
+            elif isinstance(objeto, dict):
+                slug = primer_valor(
+                    objeto,
+                    ["slug", "leagueSlug", "id", "leagueId"],
+                )
+                nombre = primer_valor(
+                    objeto,
+                    ["name", "displayName", "leagueName", "title"],
+                )
 
-    # Formato ESPN
-    if isinstance(status, dict):
-        tipo = status.get("type", {})
-        if isinstance(tipo, dict):
-            estado_espn = str(tipo.get("state", "")).lower()
-            if estado_espn == "post":
-                return "FINAL"
-            if estado_espn == "in":
-                return "EN JUEGO"
-            if estado_espn == "pre":
-                return "PROGRAMADO"
-
-    return "PROGRAMADO"
-
-
-def normalizar_partido(partido, slug):
-    local, visita = equipos_partido(partido)
-    dt = fecha_utc(partido)
-
-    goles_local = obtener_marcador(local)
-    goles_visita = obtener_marcador(visita)
-
-    # Algunos feeds guardan el marcador en score.fullTime.
-    if goles_local is None or goles_visita is None:
-        score = partido.get("score", {})
-        if isinstance(score, dict):
-            full = score.get("fullTime", score.get("full_time", {}))
-            if isinstance(full, dict):
-                try:
-                    goles_local = (
-                        goles_local if goles_local is not None
-                        else int(full["home"])
+                if slug is not None and nombre is not None:
+                    registros.append(
+                        {
+                            "slug": str(slug),
+                            "name": str(nombre),
+                        }
                     )
-                    goles_visita = (
-                        goles_visita if goles_visita is not None
-                        else int(full["away"])
-                    )
-                except (KeyError, ValueError, TypeError):
-                    pass
+                else:
+                    for valor in objeto.values():
+                        if isinstance(valor, (list, dict)):
+                            recorrer(valor)
 
-    estado = estado_partido(partido)
-    tiene_marcador = (
-        goles_local is not None and goles_visita is not None
-    )
+        recorrer(payload)
 
-    if estado == "FINAL" and tiene_marcador:
-        finalizado = True
-    else:
-        finalizado = False
+        unicas = {}
+        for liga in registros:
+            unicas[liga["slug"]] = liga
 
-    return {
-        "id": str(primer_valor(partido, ("id", "eventId", "matchId"), "")),
-        "slug": slug,
-        "fecha": dt,
-        "local": nombre_equipo(local),
-        "visita": nombre_equipo(visita),
-        "local_id": id_equipo(local),
-        "visita_id": id_equipo(visita),
-        "goles_local": goles_local,
-        "goles_visita": goles_visita,
-        "estado": estado,
-        "finalizado": finalizado,
-        "raw": partido,
-    }
+        if unicas:
+            return sorted(
+                unicas.values(),
+                key=lambda liga: liga["name"].lower(),
+            ), None
 
-
-def tiene_marcador(p):
-    return p["goles_local"] is not None and p["goles_visita"] is not None
-
-
-def texto_partido(p):
-    if p["fecha"]:
-        fecha_txt = p["fecha"].astimezone().strftime("%d-%m %H:%M")
-    else:
-        fecha_txt = "Fecha desconocida"
-
-    if tiene_marcador(p):
-        marcador = f'{p["goles_local"]} - {p["goles_visita"]}'
-    else:
-        marcador = "vs."
-
-    return f'{fecha_txt} | {p["local"]} {marcador} {p["visita"]}'
-
-
-def clave_equipo(nombre):
-    return str(nombre).strip().casefold()
-
-
-# -------------------- ESTADÍSTICAS --------------------
-
-def resumen_equipo(partidos, equipo, condicion=None, limite=5):
-    nombre = clave_equipo(equipo)
-    elegidos = []
-
-    for p in partidos:
-        if not p["finalizado"] or not tiene_marcador(p):
-            continue
-
-        local = clave_equipo(p["local"])
-        visita = clave_equipo(p["visita"])
-
-        if local == nombre:
-            lado = "home"
-            gf, gc = p["goles_local"], p["goles_visita"]
-            rival = p["visita"]
-        elif visita == nombre:
-            lado = "away"
-            gf, gc = p["goles_visita"], p["goles_local"]
-            rival = p["local"]
-        else:
-            continue
-
-        if condicion and lado != condicion:
-            continue
-
-        if p["fecha"] is None:
-            continue
-
-        elegidos.append((p, gf, gc, rival, lado))
-
-    elegidos.sort(key=lambda x: x[0]["fecha"], reverse=True)
-    elegidos = elegidos[:limite]
-
-    victorias = empates = derrotas = gf_total = gc_total = 0
-    filas = []
-
-    for p, gf, gc, rival, lado in elegidos:
-        gf_total += gf
-        gc_total += gc
-
-        if gf > gc:
-            victorias += 1
-            forma = "V"
-        elif gf == gc:
-            empates += 1
-            forma = "E"
-        else:
-            derrotas += 1
-            forma = "D"
-
-        filas.append({
-            "Fecha": p["fecha"].astimezone().strftime("%d-%m-%Y"),
-            "Condición": "Local" if lado == "home" else "Visitante",
-            "Rival": rival,
-            "Marcador": f"{gf} - {gc}",
-            "Forma": forma,
-        })
-
-    n = len(elegidos)
-
-    return {
-        "jugados": n,
-        "victorias": victorias,
-        "empates": empates,
-        "derrotas": derrotas,
-        "gf": gf_total,
-        "gc": gc_total,
-        "prom_gf": gf_total / n if n else None,
-        "prom_gc": gc_total / n if n else None,
-        "puntos": victorias * 3 + empates,
-        "filas": filas,
-    }
-
-
-def mostrar_resumen(titulo, resumen):
-    st.markdown(f"#### {titulo}")
-
-    if resumen["jugados"] == 0:
-        st.warning(
-            "No hay resultados finalizados suficientes en los datos "
-            "recibidos para calcular esta sección."
+        return respaldo, (
+            "La API respondió, pero no reconocí el formato del catálogo."
         )
-        return
 
-    a, b, c = st.columns(3)
-    a.metric("Partidos", resumen["jugados"])
-    b.metric(
-        "V / E / D",
-        f'{resumen["victorias"]} / {resumen["empates"]} / '
-        f'{resumen["derrotas"]}',
+    except Exception as error:
+        return respaldo, str(error)
+
+
+# =========================================================
+# PARTIDOS Y CACHÉ
+# =========================================================
+
+@st.cache_data(ttl=300, show_spinner=False)
+def cargar_partidos(slug, fecha_desde, fecha_hasta):
+    desde_api = fecha_desde.strftime("%Y%m%d")
+    hasta_api = fecha_hasta.strftime("%Y%m%d")
+
+    payload = consultar_api(
+        f"{slug}/fixtures",
+        {
+            "status": "all",
+            "from": desde_api,
+            "to": hasta_api,
+        },
     )
-    c.metric("Goles a favor / en contra", f'{resumen["gf"]} / {resumen["gc"]}')
+
+    return payload
+
+
+# =========================================================
+# ANÁLISIS DE FORMA
+# =========================================================
+
+def parece_finalizado(estado, goles_local, goles_visitante):
+    texto = estado.lower()
+
+    estados_finales = [
+        "finished", "final", "full time", "ft", "ended",
+        "complete", "completed", "terminado", "finalizado",
+    ]
+
+    if any(palabra in texto for palabra in estados_finales):
+        return goles_local is not None and goles_visitante is not None
+
+    return False
+
+
+def calcular_forma(partidos, equipo):
+    """
+    Calcula los últimos resultados encontrados en los datos disponibles.
+    No asume que la API tenga toda la historia del equipo.
+    """
+    historial = []
+
+    for partido in partidos:
+        if not parece_finalizado(
+            partido["Estado"],
+            partido["Goles local"],
+            partido["Goles visitante"],
+        ):
+            continue
+
+        local = partido["Local"]
+        visitante = partido["Visitante"]
+
+        if equipo != local and equipo != visitante:
+            continue
+
+        gl = partido["Goles local"]
+        gv = partido["Goles visitante"]
+
+        if equipo == local:
+            goles_favor, goles_contra = gl, gv
+        else:
+            goles_favor, goles_contra = gv, gl
+
+        if goles_favor > goles_contra:
+            resultado = "G"
+        elif goles_favor < goles_contra:
+            resultado = "P"
+        else:
+            resultado = "E"
+
+        historial.append(
+            {
+                "Fecha": partido["Fecha"],
+                "Resultado": resultado,
+                "GF": goles_favor,
+                "GC": goles_contra,
+            }
+        )
+
+    historial.sort(
+        key=lambda fila: fila["Fecha"] or date.min
+    )
+
+    return historial[-5:]
+
+
+def resumen_forma(historial):
+    if not historial:
+        return "Sin datos suficientes", 0, 0, 0
+
+    victorias = sum(x["Resultado"] == "G" for x in historial)
+    empates = sum(x["Resultado"] == "E" for x in historial)
+    derrotas = sum(x["Resultado"] == "P" for x in historial)
+    puntos = victorias * 3 + empates
+
+    forma = " - ".join(x["Resultado"] for x in historial)
+
+    return forma, puntos, victorias, empates, derrotas
+
+
+# =========================================================
+# INTERFAZ
+# =========================================================
+
+with st.sidebar:
+    st.header("⚙️ Configuración")
+
+    fecha_hasta = st.date_input(
+        "Hasta la fecha",
+        value=date.today(),
+    )
+
+    fecha_desde = st.date_input(
+        "Desde la fecha",
+        value=date.today() - timedelta(days=120),
+    )
 
     st.caption(
-        f'Promedio marcado: {resumen["prom_gf"]:.2f} goles por partido. '
-        f'Promedio recibido: {resumen["prom_gc"]:.2f}. '
-        f'Puntos: {resumen["puntos"]} de {resumen["jugados"] * 3}.'
+        "Para analizar forma reciente, conviene consultar varios "
+        "meses de partidos. La cobertura histórica depende de la API."
     )
 
-    st.dataframe(
-        pd.DataFrame(resumen["filas"]),
-        hide_index=True,
+    actualizar = st.button(
+        "🔄 Actualizar datos",
         use_container_width=True,
     )
 
+if fecha_desde > fecha_hasta:
+    st.error("La fecha inicial no puede ser posterior a la fecha final.")
+    st.stop()
 
-def comparar(local, visitante):
-    st.markdown("### Comparación estadística")
+if actualizar:
+    st.cache_data.clear()
 
-    if not local["jugados"] or not visitante["jugados"]:
-        st.warning(
-            "No se puede comparar a ambos equipos de manera responsable: "
-            "faltan resultados recientes en la respuesta de la fuente."
+with st.spinner("Buscando competiciones disponibles..."):
+    ligas, error_catalogo = cargar_ligas()
+
+if error_catalogo:
+    st.warning(
+        "No pude cargar el catálogo automático de competiciones. "
+        "Estoy mostrando una lista de respaldo. Algunas ligas podrían "
+        "no estar disponibles en MatchGrind."
+    )
+
+opciones_ligas = {
+    f'{liga["name"]} ({liga["slug"]})': liga
+    for liga in ligas
+}
+
+seleccion_nombres = st.multiselect(
+    "Selecciona las competiciones",
+    options=list(opciones_ligas.keys()),
+    default=[
+        nombre
+        for nombre in opciones_ligas
+        if any(
+            palabra in nombre.lower()
+            for palabra in ["premier league", "laliga"]
         )
-        return
-
-    pp_local = local["puntos"] / local["jugados"]
-    pp_visita = visitante["puntos"] / visitante["jugados"]
-
-    st.write(
-        f'**Equipo local:** {pp_local:.2f} puntos por partido; '
-        f'{local["prom_gf"]:.2f} goles marcados y '
-        f'{local["prom_gc"]:.2f} recibidos por partido.'
-    )
-    st.write(
-        f'**Equipo visitante:** {pp_visita:.2f} puntos por partido; '
-        f'{visitante["prom_gf"]:.2f} goles marcados y '
-        f'{visitante["prom_gc"]:.2f} recibidos por partido.'
-    )
-
-    diferencia = pp_local - pp_visita
-    if diferencia > 0.5:
-        st.info("Los resultados disponibles favorecen al local en puntos por partido.")
-    elif diferencia < -0.5:
-        st.info("Los resultados disponibles favorecen al visitante en puntos por partido.")
-    else:
-        st.info("Los puntos por partido son parecidos en la muestra disponible.")
-
-    st.caption(
-        "Esto describe resultados anteriores; no es una probabilidad "
-        "de victoria. No incorpora automáticamente lesiones, alineaciones "
-        "ni fuerza de los rivales."
-    )
-
-
-# -------------------- INTERFAZ --------------------
-
-st.title("⚽ CanchaLab IA")
-st.subheader("Análisis de fútbol con MatchGrind")
-
-st.write(
-    "Consulta partidos, resultados y rendimiento reciente. "
-    "El análisis utiliza exclusivamente datos que devuelve la fuente."
+    ][:2],
 )
 
-st.caption(
-    "MatchGrind declara endpoints públicos sin API key. "
-    "La disponibilidad y profundidad de datos pueden variar por competición."
-)
+col1, col2, col3 = st.columns(3)
+col1.metric("Competiciones disponibles", len(ligas))
+col2.metric("Inicio del análisis", fecha_desde.strftime("%d-%m-%Y"))
+col3.metric("Fin del análisis", fecha_hasta.strftime("%d-%m-%Y"))
 
-with st.sidebar:
-    st.header("Configuración")
-
-    nombres_ligas = list(LIGAS.keys())
-    seleccion = st.multiselect(
-        "Competiciones",
-        nombres_ligas,
-        default=[
-            "Premier League (Inglaterra)",
-            "La Liga (España)",
-            "Champions League",
-            "Copa Libertadores",
-            "Copa Sudamericana",
-            "Primera División de Chile (probar cobertura)",
-        ],
-    )
-
-    hoy = date.today()
-    desde = st.date_input("Desde", value=hoy)
-    hasta = st.date_input("Hasta", value=hoy + timedelta(days=7))
-
-    st.caption(
-        "Comienza con 2 o 3 competiciones para probar la cobertura "
-        "y reducir las consultas."
-    )
-
-if not seleccion:
-    st.info("Selecciona al menos una competición.")
+if not seleccion_nombres:
+    st.info("Selecciona al menos una competición para comenzar.")
     st.stop()
 
-if hasta < desde:
-    st.error("La fecha final no puede ser anterior a la fecha inicial.")
-    st.stop()
-
-todos = []
+partidos_normalizados = []
 errores = []
-cobertura = []
+respuestas_vacias = []
 
-with st.spinner("Consultando partidos y resultados en MatchGrind..."):
-    for nombre_liga in seleccion:
-        slug = LIGAS[nombre_liga]
+with st.spinner("Descargando partidos..."):
+    for nombre_seleccionado in seleccion_nombres:
+        liga = opciones_ligas[nombre_seleccionado]
 
         try:
-            raw = cargar_fixtures(slug)
-            normalizados = [
-                normalizar_partido(item, slug)
-                for item in raw
-                if isinstance(item, dict)
-            ]
+            payload = cargar_partidos(
+                liga["slug"],
+                fecha_desde,
+                fecha_hasta,
+            )
 
-            # Quitar duplicados cuando existe ID.
-            vistos = set()
-            unicos = []
+            registros = buscar_lista_partidos(payload)
 
-            for p in normalizados:
-                clave = p["id"] or (
-                    p["fecha"], p["local"], p["visita"]
+            if not registros:
+                respuestas_vacias.append(
+                    {
+                        "Competición": liga["name"],
+                        "Slug": liga["slug"],
+                        "Respuesta": payload,
+                    }
                 )
-                if clave in vistos:
+                continue
+
+            for registro in registros:
+                partido = normalizar_partido(
+                    registro,
+                    liga["name"],
+                )
+
+                if partido is None:
                     continue
-                vistos.add(clave)
-                p["competicion"] = nombre_liga
-                unicos.append(p)
 
-            todos.extend(unicos)
-            cobertura.append({
-                "Competición": nombre_liga,
-                "Partidos recibidos": len(unicos),
-                "Resultados finalizados": sum(
-                    1 for p in unicos
-                    if p["finalizado"] and tiene_marcador(p)
-                ),
-            })
+                if partido["Fecha"] is not None:
+                    if not fecha_desde <= partido["Fecha"] <= fecha_hasta:
+                        continue
 
-        except RuntimeError as exc:
-            errores.append(f"{nombre_liga}: {exc}")
+                partidos_normalizados.append(partido)
+
+        except Exception as error:
+            errores.append(
+                f'{liga["name"]} ({liga["slug"]}): {error}'
+            )
+
+# Elimina duplicados por competición, fecha y equipos.
+unicos = {}
+
+for partido in partidos_normalizados:
+    clave = (
+        partido["Competición"],
+        partido["Fecha"],
+        partido["Local"],
+        partido["Visitante"],
+    )
+    unicos[clave] = partido
+
+partidos_normalizados = list(unicos.values())
+partidos_normalizados.sort(
+    key=lambda p: (
+        p["Fecha"] or date.min,
+        p["Competición"],
+        p["Local"],
+    ),
+    reverse=True,
+)
 
 if errores:
-    with st.expander("⚠️ Consultas que no funcionaron"):
-        for err in errores:
-            st.warning(err)
+    with st.expander("⚠️ Errores al consultar algunas competiciones"):
+        for error in errores:
+            st.error(error)
 
-# Si no se ha recibido ningún partido, no fabricar contenido.
-if not todos:
+if not partidos_normalizados:
     st.error(
-        "MatchGrind no devolvió partidos utilizables para las "
-        "competiciones seleccionadas. Puede ser un problema de cobertura "
-        "o de formato/respuesta del endpoint."
+        "No pude obtener partidos utilizables para las competiciones "
+        "seleccionadas. Esto puede deberse a que la liga no está cubierta, "
+        "la API está temporalmente caída o la respuesta usa otro formato."
     )
-    st.markdown(
-        "Revisa la documentación: "
-        "[MatchGrind Football API](https://www.matchgrind.space/football-api)"
+
+    st.subheader("Diagnóstico")
+
+    st.write("Endpoint base:", BASE_URL)
+    st.write("Competiciones seleccionadas:", seleccion_nombres)
+
+    if respuestas_vacias:
+        st.write("La API respondió, pero no encontré partidos reconocibles.")
+
+        for vacia in respuestas_vacias:
+            with st.expander(
+                f'{vacia["Competición"]} — respuesta recibida'
+            ):
+                st.json(vacia["Respuesta"])
+
+    try:
+        meta = consultar_api("meta")
+        with st.expander("Respuesta del endpoint meta"):
+            st.json(meta)
+    except Exception as error:
+        st.warning(f"No pude consultar /meta: {error}")
+
+    try:
+        catalogo = consultar_api(
+            "leagues",
+            {"kind": "club", "available": "true"},
+        )
+        with st.expander("Respuesta original del catálogo de ligas"):
+            st.json(catalogo)
+    except Exception as error:
+        st.warning(f"No pude consultar el catálogo: {error}")
+
+    st.info(
+        "Si aparece un JSON en el diagnóstico, envíame una captura. "
+        "Con esa respuesta podemos adaptar el lector al formato real."
     )
     st.stop()
 
-# Eliminar duplicados entre competiciones por ID.
-finales = {}
-for p in todos:
-    clave = (p["id"], p["competicion"]) if p["id"] else (
-        p["competicion"], p["fecha"], p["local"], p["visita"]
+
+# =========================================================
+# RESUMEN DE PARTIDOS
+# =========================================================
+
+st.success(
+    f"Se encontraron {len(partidos_normalizados)} partidos utilizables."
+)
+
+datos_tabla = []
+
+for partido in partidos_normalizados:
+    gl = partido["Goles local"]
+    gv = partido["Goles visitante"]
+
+    marcador = (
+        f"{gl} - {gv}"
+        if gl is not None and gv is not None
+        else "Sin marcador"
     )
-    finales[clave] = p
 
-todos = list(finales.values())
+    datos_tabla.append(
+        {
+            "Fecha": (
+                partido["Fecha"].strftime("%d-%m-%Y")
+                if partido["Fecha"]
+                else "Sin fecha"
+            ),
+            "Competición": partido["Competición"],
+            "Local": partido["Local"],
+            "Marcador": marcador,
+            "Visitante": partido["Visitante"],
+            "Estado": partido["Estado"],
+        }
+    )
 
-def en_rango(p):
-    if not p["fecha"]:
-        return False
-    fecha_local = p["fecha"].astimezone().date()
-    return desde <= fecha_local <= hasta
+df = pd.DataFrame(datos_tabla)
 
-partidos_rango = [p for p in todos if en_rango(p)]
-partidos_rango.sort(key=lambda p: p["fecha"] or datetime.max.replace(tzinfo=timezone.utc))
+st.subheader("📅 Partidos encontrados")
 
-pendientes = [
-    p for p in partidos_rango
-    if not p["finalizado"] and p["estado"] != "NO DISPONIBLE"
-]
-resultados = [
-    p for p in partidos_rango
-    if p["finalizado"] and tiene_marcador(p)
-]
+filtro_texto = st.text_input(
+    "Buscar equipo o competición",
+    placeholder="Ej.: Arsenal, Colo-Colo, Premier...",
+)
 
-tab1, tab2, tab3, tab4 = st.tabs([
-    "📅 Partidos",
-    "📊 Analizar partido",
-    "🧾 Resultados",
-    "🔎 Cobertura",
-])
+if filtro_texto:
+    mascara = df.apply(
+        lambda fila: fila.astype(str).str.contains(
+            filtro_texto,
+            case=False,
+            regex=False,
+        ).any(),
+        axis=1,
+    )
+    df_mostrar = df[mascara]
+else:
+    df_mostrar = df
 
-with tab1:
-    st.markdown("### Partidos en el rango elegido")
+st.dataframe(
+    df_mostrar,
+    use_container_width=True,
+    hide_index=True,
+)
 
-    a, b, c = st.columns(3)
-    a.metric("Partidos encontrados", len(partidos_rango))
-    b.metric("Pendientes / programados", len(pendientes))
-    c.metric("Resultados finalizados", len(resultados))
+st.download_button(
+    "⬇️ Descargar partidos en CSV",
+    data=df_mostrar.to_csv(index=False).encode("utf-8-sig"),
+    file_name="canchalab_partidos.csv",
+    mime="text/csv",
+)
 
-    if not partidos_rango:
-        st.info(
-            "No hay partidos en el rango seleccionado. Prueba con otras "
-            "fechas o comprueba si la competición está cubierta."
+
+# =========================================================
+# COMPARADOR DE EQUIPOS
+# =========================================================
+
+st.divider()
+st.subheader("🧠 Comparador de equipos")
+
+equipos = sorted(
+    {
+        equipo
+        for partido in partidos_normalizados
+        for equipo in (partido["Local"], partido["Visitante"])
+        if equipo
+    }
+)
+
+if len(equipos) >= 2:
+    c1, c2 = st.columns(2)
+
+    with c1:
+        equipo_a = st.selectbox(
+            "Equipo A",
+            equipos,
+            index=0,
         )
-    else:
-        for p in partidos_rango:
-            with st.container(border=True):
-                st.caption(p.get("competicion", "Competición desconocida"))
-                st.write(texto_partido(p))
-                st.caption(f"Estado reportado: {p['estado']}")
 
-with tab2:
-    st.markdown("### Selecciona un partido")
-
-    if not pendientes:
-        st.info(
-            "No se encontraron partidos pendientes en el rango. "
-            "Amplía las fechas o selecciona otra competición."
+    with c2:
+        indice_b = 1 if len(equipos) > 1 else 0
+        equipo_b = st.selectbox(
+            "Equipo B",
+            equipos,
+            index=indice_b,
         )
-    else:
-        opciones = {
-            f"{p['competicion']} | {texto_partido(p)}": p
-            for p in pendientes
+
+    forma_a = calcular_forma(partidos_normalizados, equipo_a)
+    forma_b = calcular_forma(partidos_normalizados, equipo_b)
+
+    def metricas_equipo(nombre, historial):
+        if not historial:
+            return {
+                "Equipo": nombre,
+                "Partidos encontrados": 0,
+                "Forma reciente": "Sin datos",
+                "Victorias": 0,
+                "Empates": 0,
+                "Derrotas": 0,
+                "Goles a favor": 0,
+                "Goles en contra": 0,
+                "Puntos de referencia": 0,
+            }
+
+        forma, puntos, victorias, empates, derrotas = resumen_forma(
+            historial
+        )
+
+        return {
+            "Equipo": nombre,
+            "Partidos encontrados": len(historial),
+            "Forma reciente": forma,
+            "Victorias": victorias,
+            "Empates": empates,
+            "Derrotas": derrotas,
+            "Goles a favor": sum(x["GF"] for x in historial),
+            "Goles en contra": sum(x["GC"] for x in historial),
+            "Puntos de referencia": puntos,
         }
 
-        etiqueta = st.selectbox("Partido", list(opciones.keys()))
-        elegido = opciones[etiqueta]
-
-        local = elegido["local"]
-        visitante = elegido["visita"]
-        slug = elegido["slug"]
-
-        st.markdown(f"## {local} vs. {visitante}")
-        st.write(f"**Competición:** {elegido['competicion']}")
-        if elegido["fecha"]:
-            st.write(
-                "**Fecha:** "
-                + elegido["fecha"].astimezone().strftime("%d-%m-%Y %H:%M")
-            )
-
-        # Solo comparar partidos de la misma competición, para no
-        # presentar como completa una forma que no se ha consultado.
-        historial_liga = [
-            p for p in todos
-            if p["slug"] == slug
-            and p["fecha"] is not None
-            and p["fecha"] < elegido["fecha"]
+    comparacion = pd.DataFrame(
+        [
+            metricas_equipo(equipo_a, forma_a),
+            metricas_equipo(equipo_b, forma_b),
         ]
+    )
 
-        forma_local = resumen_equipo(historial_liga, local, limite=5)
-        forma_visitante = resumen_equipo(historial_liga, visitante, limite=5)
+    st.dataframe(
+        comparacion,
+        use_container_width=True,
+        hide_index=True,
+    )
 
-        col1, col2 = st.columns(2)
+    if forma_a and forma_b:
+        st.caption(
+            "G = victoria, E = empate, P = derrota. "
+            "La forma utiliza los últimos partidos finalizados que la API "
+            "devolvió dentro del período seleccionado; no garantiza que "
+            "sean los cinco partidos oficiales más recientes."
+        )
 
-        with col1:
-            st.markdown(f"### 🏠 {local}")
-            mostrar_resumen("Últimos partidos disponibles", forma_local)
-            local_casa = resumen_equipo(
-                historial_liga, local, condicion="home", limite=5
-            )
-            mostrar_resumen("Últimos partidos como local", local_casa)
+    enfrentamientos = [
+        partido
+        for partido in partidos_normalizados
+        if {
+            partido["Local"].lower(),
+            partido["Visitante"].lower(),
+        } == {
+            equipo_a.lower(),
+            equipo_b.lower(),
+        }
+    ]
 
-        with col2:
-            st.markdown(f"### ✈️ {visitante}")
-            mostrar_resumen("Últimos partidos disponibles", forma_visitante)
-            visita_fuera = resumen_equipo(
-                historial_liga, visitante, condicion="away", limite=5
-            )
-            mostrar_resumen("Últimos partidos como visitante", visita_fuera)
+    st.markdown("#### Historial directo disponible")
 
-        st.divider()
-        comparar(forma_local, forma_visitante)
+    if enfrentamientos:
+        enfrentamientos_df = pd.DataFrame(
+            [
+                {
+                    "Fecha": (
+                        p["Fecha"].strftime("%d-%m-%Y")
+                        if p["Fecha"]
+                        else "Sin fecha"
+                    ),
+                    "Local": p["Local"],
+                    "Goles local": p["Goles local"],
+                    "Goles visitante": p["Goles visitante"],
+                    "Visitante": p["Visitante"],
+                    "Estado": p["Estado"],
+                }
+                for p in sorted(
+                    enfrentamientos,
+                    key=lambda x: x["Fecha"] or date.min,
+                    reverse=True,
+                )
+            ]
+        )
 
-        st.markdown("### Enfrentamientos directos disponibles")
-        h2h = [
-            p for p in historial_liga
-            if {clave_equipo(p["local"]), clave_equipo(p["visita"])}
-            == {clave_equipo(local), clave_equipo(visitante)}
-            and p["finalizado"] and tiene_marcador(p)
-        ]
-        h2h.sort(key=lambda p: p["fecha"], reverse=True)
-
-        if h2h:
-            filas = [{
-                "Fecha": p["fecha"].astimezone().strftime("%d-%m-%Y"),
-                "Local": p["local"],
-                "Marcador": f'{p["goles_local"]} - {p["goles_visita"]}',
-                "Visitante": p["visita"],
-            } for p in h2h[:5]]
-
-            st.dataframe(
-                pd.DataFrame(filas),
-                hide_index=True,
-                use_container_width=True,
-            )
-        else:
-            st.info(
-                "No hay enfrentamientos directos disponibles en los "
-                "datos recibidos de esta competición."
-            )
-
-with tab3:
-    st.markdown("### Resultados finalizados en el rango")
-
-    if not resultados:
-        st.info("No se encontraron resultados finalizados en estas fechas.")
+        st.dataframe(
+            enfrentamientos_df,
+            use_container_width=True,
+            hide_index=True,
+        )
     else:
-        filas = []
-        for p in resultados:
-            filas.append({
-                "Fecha": (
-                    p["fecha"].astimezone().strftime("%d-%m-%Y")
-                    if p["fecha"] else "Desconocida"
-                ),
-                "Competición": p.get("competicion", ""),
-                "Local": p["local"],
-                "Goles local": p["goles_local"],
-                "Goles visitante": p["goles_visita"],
-                "Visitante": p["visita"],
-            })
-
-        st.dataframe(
-            pd.DataFrame(filas),
-            hide_index=True,
-            use_container_width=True,
+        st.info(
+            "No encontré enfrentamientos directos entre ambos equipos "
+            "en los datos descargados."
         )
 
-with tab4:
-    st.markdown("### Cobertura recibida desde MatchGrind")
-
-    if cobertura:
-        st.dataframe(
-            pd.DataFrame(cobertura),
-            hide_index=True,
-            use_container_width=True,
-        )
-
-    st.write(
-        "Esta tabla refleja lo que devolvió la API durante esta consulta. "
-        "Una competición con pocos partidos puede tener cobertura limitada "
-        "o una temporada incompleta."
+else:
+    st.info(
+        "No hay suficientes equipos en los partidos descargados "
+        "para activar el comparador."
     )
 
-    st.markdown(
-        "[Documentación oficial de MatchGrind](https://www.matchgrind.space/football-api)"
-    )
+
+# =========================================================
+# NOTA FINAL
+# =========================================================
 
 st.divider()
 st.caption(
-    "CanchaLab IA · Datos consultados desde MatchGrind. "
-    "Los resultados y promedios describen datos disponibles; "
-    "no garantizan resultados futuros."
+    "CanchaLab IA es una herramienta informativa. Las estadísticas "
+    "dependen de la disponibilidad y calidad de la fuente. "
+    "No garantiza resultados deportivos ni ganancias en apuestas."
 )
