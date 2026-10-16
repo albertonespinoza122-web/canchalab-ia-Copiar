@@ -3,11 +3,10 @@ import streamlit as st
 import pandas as pd
 import requests
 from datetime import date, timedelta
-from zoneinfo import ZoneInfo
 
-# --------------------------------------------------
+# ==================================================
 # CONFIGURACIÓN
-# --------------------------------------------------
+# ==================================================
 st.set_page_config(
     page_title="CanchaLab IA",
     page_icon="⚽",
@@ -18,28 +17,24 @@ API_URL = "https://v3.football.api-sports.io"
 ZONA_CHILE = "America/Santiago"
 
 st.title("⚽ CanchaLab IA")
-st.subheader("Tu centro de análisis futbolístico")
-st.write(
-    "Consulta próximos partidos, probabilidades de resultado "
-    "y rendimiento reciente de los equipos."
-)
+st.caption("Partidos próximos · Pronósticos · Estadísticas · Forma reciente")
 
-# --------------------------------------------------
+# ==================================================
 # CLAVE API
-# --------------------------------------------------
+# ==================================================
 try:
     API_KEY = st.secrets["API_FOOTBALL_KEY"]
 except Exception:
     st.error(
-        "No encuentro API_FOOTBALL_KEY. Configúrala en "
-        "Streamlit Cloud → Settings → Secrets."
+        "No se encontró API_FOOTBALL_KEY. "
+        "Configúrala en Streamlit Cloud → Settings → Secrets."
     )
     st.stop()
 
 
-# --------------------------------------------------
-# CONEXIÓN CON API-FOOTBALL
-# --------------------------------------------------
+# ==================================================
+# FUNCIONES API
+# ==================================================
 @st.cache_data(ttl=900, show_spinner=False)
 def consultar_api(endpoint, parametros, clave):
     respuesta = requests.get(
@@ -52,16 +47,15 @@ def consultar_api(endpoint, parametros, clave):
     respuesta.raise_for_status()
     datos = respuesta.json()
 
-    errores = datos.get("errors")
-    if errores:
-        raise RuntimeError(f"API-Football: {errores}")
+    if datos.get("errors"):
+        raise RuntimeError(f"API-Football: {datos['errors']}")
 
     return datos.get("response", [])
 
 
 def formato_fecha(fecha_iso):
     if not fecha_iso:
-        return "Horario no disponible"
+        return "No disponible"
 
     try:
         fecha_dt = pd.to_datetime(fecha_iso, utc=True)
@@ -72,7 +66,7 @@ def formato_fecha(fecha_iso):
         return str(fecha_iso)
 
 
-def convertir_porcentaje(valor):
+def porcentaje(valor):
     if valor is None:
         return None
 
@@ -82,37 +76,104 @@ def convertir_porcentaje(valor):
         return None
 
 
-def cargar_ultimos_partidos(team_id):
-    datos = consultar_api(
-        "fixtures",
-        {
-            "team": team_id,
-            "last": 5,
-            "timezone": ZONA_CHILE
-        },
-        API_KEY
+# ==================================================
+# ÚLTIMOS CINCO PARTIDOS
+# No usa el parámetro "last", restringido en el plan Free.
+# Consulta por equipo y temporada.
+# ==================================================
+@st.cache_data(ttl=900, show_spinner=False)
+def cargar_ultimos_partidos(team_id, clave):
+    ahora = pd.Timestamp.now(tz=ZONA_CHILE)
+    anio_actual = ahora.year
+
+    partidos = []
+    errores_consulta = []
+
+    # Prueba la temporada actual y, si es necesario,
+    # la anterior. No utiliza el parámetro "last".
+    for temporada in [anio_actual, anio_actual - 1]:
+        try:
+            encontrados = consultar_api(
+                "fixtures",
+                {
+                    "team": team_id,
+                    "season": temporada
+                },
+                clave
+            )
+
+            partidos.extend(encontrados)
+
+            finalizados = [
+                p for p in partidos
+                if p.get("fixture", {}).get("status", {}).get("short")
+                in ("FT", "AET", "PEN")
+                and p.get("goals", {}).get("home") is not None
+                and p.get("goals", {}).get("away") is not None
+            ]
+
+            if len(finalizados) >= 5:
+                break
+
+        except Exception as e:
+            errores_consulta.append(str(e))
+
+    # Elimina duplicados por ID.
+    unicos = {}
+    for p in partidos:
+        partido_id = p.get("fixture", {}).get("id")
+        if partido_id is not None:
+            unicos[partido_id] = p
+
+    partidos = list(unicos.values())
+
+    # Solo partidos finalizados hasta la fecha actual.
+    finalizados = []
+
+    for p in partidos:
+        fixture = p.get("fixture", {})
+        estado = fixture.get("status", {}).get("short")
+
+        if estado not in ("FT", "AET", "PEN"):
+            continue
+
+        goles = p.get("goals", {})
+        if goles.get("home") is None or goles.get("away") is None:
+            continue
+
+        try:
+            fecha_partido = pd.to_datetime(
+                fixture.get("date"), utc=True
+            )
+            if fecha_partido > ahora.tz_convert("UTC"):
+                continue
+        except Exception:
+            continue
+
+        finalizados.append(p)
+
+    finalizados.sort(
+        key=lambda p: p.get("fixture", {}).get("date", "")
     )
 
-    filas = []
+    recientes = finalizados[-5:]
+
     victorias = 0
     empates = 0
     derrotas = 0
     goles_favor = 0
     goles_contra = 0
+    filas = []
 
-    for p in datos:
+    for p in recientes:
         fixture = p.get("fixture", {})
         equipos = p.get("teams", {})
         goles = p.get("goals", {})
 
         local = equipos.get("home", {})
         visita = equipos.get("away", {})
-
-        gl = goles.get("home")
-        gv = goles.get("away")
-
-        if gl is None or gv is None:
-            continue
+        gl = goles["home"]
+        gv = goles["away"]
 
         if local.get("id") == team_id:
             gf, gc = gl, gv
@@ -152,45 +213,39 @@ def cargar_ultimos_partidos(team_id):
         "Goles en contra": goles_contra
     }
 
-    return resumen, pd.DataFrame(filas)
+    return resumen, pd.DataFrame(filas), errores_consulta
 
 
-# --------------------------------------------------
-# BUSCAR PARTIDOS POR FECHA
-# Se utiliza date, sin from/to/timezone en esta consulta.
-# --------------------------------------------------
+# ==================================================
+# BUSCAR PARTIDOS PRÓXIMOS
+# Consulta individual por día.
+# ==================================================
 st.divider()
 st.header("📅 Próximos partidos")
 
-hoy_chile = date.today()
-
-try:
-    hoy_chile = pd.Timestamp.now(tz=ZONA_CHILE).date()
-except Exception:
-    pass
+hoy = pd.Timestamp.now(tz=ZONA_CHILE).date()
 
 col1, col2 = st.columns(2)
 
 with col1:
     fecha_inicio = st.date_input(
         "Fecha de inicio",
-        value=hoy_chile
+        value=hoy
     )
 
 with col2:
-    cantidad_dias = st.selectbox(
-        "Período de búsqueda",
+    dias = st.selectbox(
+        "Período",
         [1, 3, 7, 14],
         index=0,
-        format_func=lambda x: f"{x} día(s)"
+        format_func=lambda n: f"{n} día(s)"
     )
 
-fecha_fin = fecha_inicio + timedelta(days=cantidad_dias - 1)
+fecha_fin = fecha_inicio + timedelta(days=dias - 1)
 
 st.caption(
-    f"Buscaremos del {fecha_inicio.strftime('%d/%m/%Y')} "
-    f"al {fecha_fin.strftime('%d/%m/%Y')}. "
-    "La búsqueda utiliza una consulta por día."
+    f"Fechas: {fecha_inicio.strftime('%d/%m/%Y')} "
+    f"al {fecha_fin.strftime('%d/%m/%Y')}"
 )
 
 if st.button(
@@ -198,73 +253,72 @@ if st.button(
     type="primary",
     use_container_width=True
 ):
-    st.session_state["partidos_busqueda"] = None
-    st.session_state["partidos_error"] = None
+    st.session_state["partidos"] = None
+    st.session_state["error_busqueda"] = None
+    st.session_state.pop("analisis_id", None)
 
     try:
-        lista_partidos = []
+        resultados = []
 
-        with st.spinner("Buscando el calendario..."):
-            for numero_dia in range(cantidad_dias):
-                dia = fecha_inicio + timedelta(days=numero_dia)
+        with st.spinner("Consultando calendario..."):
+            for i in range(dias):
+                dia = fecha_inicio + timedelta(days=i)
 
-                resultados = consultar_api(
+                del_dia = consultar_api(
                     "fixtures",
                     {"date": dia.isoformat()},
                     API_KEY
                 )
 
-                lista_partidos.extend(resultados)
+                resultados.extend(del_dia)
 
-        # Elimina posibles duplicados por ID de partido.
+        # Eliminar duplicados.
         unicos = {}
-        for p in lista_partidos:
+        for p in resultados:
             partido_id = p.get("fixture", {}).get("id")
             if partido_id is not None:
                 unicos[partido_id] = p
 
-        lista_partidos = list(unicos.values())
+        resultados = list(unicos.values())
 
-        # Solo encuentros no iniciados.
-        lista_partidos = [
-            p for p in lista_partidos
-            if p.get("fixture", {})
-                .get("status", {})
-                .get("short") in ("NS", "TBD")
+        # Solo encuentros que no hayan comenzado.
+        resultados = [
+            p for p in resultados
+            if p.get("fixture", {}).get("status", {}).get("short")
+            in ("NS", "TBD")
         ]
 
-        lista_partidos.sort(
+        resultados.sort(
             key=lambda p: p.get("fixture", {}).get("date", "")
         )
 
-        st.session_state["partidos_busqueda"] = lista_partidos
+        st.session_state["partidos"] = resultados
 
     except requests.HTTPError as e:
-        st.session_state["partidos_error"] = (
-            f"Error HTTP al consultar la API: {e}. "
-            "Comprueba tu clave y los límites de tu plan."
+        st.session_state["error_busqueda"] = (
+            f"Error HTTP: {e}. Revisa tu clave y tu plan."
         )
     except requests.RequestException as e:
-        st.session_state["partidos_error"] = (
+        st.session_state["error_busqueda"] = (
             f"Problema de conexión: {e}"
         )
     except Exception as e:
-        st.session_state["partidos_error"] = str(e)
+        st.session_state["error_busqueda"] = str(e)
 
 
-if st.session_state.get("partidos_error"):
-    st.error(st.session_state["partidos_error"])
+if st.session_state.get("error_busqueda"):
+    st.error(st.session_state["error_busqueda"])
 
-partidos = st.session_state.get("partidos_busqueda")
+partidos = st.session_state.get("partidos")
 
 if partidos is not None:
     if not partidos:
         st.warning(
-            "No encontramos partidos pendientes en esas fechas. "
-            "Prueba otro día o amplía el período."
+            "No hay partidos pendientes para ese período. "
+            "Prueba con otra fecha o amplía la búsqueda."
         )
     else:
-        st.success(f"Encontramos {len(partidos)} partidos próximos.")
+        st.success(f"Partidos encontrados: {len(partidos)}")
 
         opciones = {}
 
@@ -275,18 +329,17 @@ if partidos is not None:
 
             local = equipos.get("home", {}).get("name", "Local")
             visita = equipos.get("away", {}).get("name", "Visitante")
-            nombre_liga = liga.get("name", "Competición")
-            horario = formato_fecha(fixture.get("date"))
+            competicion = liga.get("name", "Competición")
             partido_id = fixture.get("id")
 
             etiqueta = (
-                f"{horario} | {local} vs {visita} | "
-                f"{nombre_liga} | ID {partido_id}"
+                f"{formato_fecha(fixture.get('date'))} | "
+                f"{local} vs {visita} | {competicion} | ID {partido_id}"
             )
             opciones[etiqueta] = p
 
         seleccion = st.selectbox(
-            "Selecciona el partido",
+            "Selecciona un encuentro",
             list(opciones.keys())
         )
 
@@ -301,16 +354,15 @@ if partidos is not None:
 
         st.divider()
         st.subheader(
-            f"{local.get('name', 'Local')} vs "
-            f"{visita.get('name', 'Visitante')}"
+            f"{local.get('name')} vs {visita.get('name')}"
         )
 
         st.write(
             f"**Competición:** {liga.get('name', 'No disponible')} "
-            f"({liga.get('country', '')})"
+            f"— {liga.get('country', '')}"
         )
         st.write(
-            f"**Fecha y hora de Chile:** "
+            f"**Horario de Chile:** "
             f"{formato_fecha(fixture.get('date'))}"
         )
 
@@ -323,9 +375,7 @@ if partidos is not None:
 
         if st.session_state.get("analisis_id") == partido_id:
             try:
-                with st.spinner(
-                    "Analizando pronóstico y forma reciente..."
-                ):
+                with st.spinner("Analizando el encuentro..."):
                     predicciones = consultar_api(
                         "predictions",
                         {"fixture": partido_id},
@@ -334,34 +384,28 @@ if partidos is not None:
 
                     pred = {}
                     if predicciones:
-                        pred = predicciones[0].get(
-                            "predictions", {}
-                        ) or {}
+                        pred = (
+                            predicciones[0].get("predictions", {}) or {}
+                        )
 
-                    forma_local, tabla_local = cargar_ultimos_partidos(
-                        local.get("id")
+                    forma_local, tabla_local, errores_local = (
+                        cargar_ultimos_partidos(local.get("id"), API_KEY)
                     )
-                    forma_visita, tabla_visita = cargar_ultimos_partidos(
-                        visita.get("id")
+                    forma_visita, tabla_visita, errores_visita = (
+                        cargar_ultimos_partidos(visita.get("id"), API_KEY)
                     )
 
-                st.header("🎯 Probabilidades de resultado")
+                st.header("🎯 Probabilidades")
 
-                porcentaje_pred = pred.get("percent", {}) or {}
+                porcentajes = pred.get("percent", {}) or {}
 
-                p_local = convertir_porcentaje(
-                    porcentaje_pred.get("home")
-                )
-                p_empate = convertir_porcentaje(
-                    porcentaje_pred.get("draw")
-                )
-                p_visita = convertir_porcentaje(
-                    porcentaje_pred.get("away")
-                )
+                p_local = porcentaje(porcentajes.get("home"))
+                p_empate = porcentaje(porcentajes.get("draw"))
+                p_visita = porcentaje(porcentajes.get("away"))
 
                 if any(
                     v is not None
-                    for v in [p_local, p_empate, p_visita]
+                    for v in (p_local, p_empate, p_visita)
                 ):
                     c1, c2, c3 = st.columns(3)
 
@@ -386,24 +430,21 @@ if partidos is not None:
                             if p_visita is not None else "N/D"
                         )
 
-                    datos_grafico = {
+                    grafico = {
                         "Victoria local": p_local,
                         "Empate": p_empate,
                         "Victoria visitante": p_visita
                     }
-
-                    datos_grafico = {
-                        k: v for k, v in datos_grafico.items()
+                    grafico = {
+                        k: v for k, v in grafico.items()
                         if v is not None
                     }
 
-                    st.bar_chart(
-                        pd.Series(datos_grafico, name="Probabilidad (%)")
-                    )
+                    st.bar_chart(pd.Series(grafico))
                 else:
                     st.warning(
-                        "No hay probabilidades disponibles para este "
-                        "partido en API-Football. No inventaremos cifras."
+                        "API-Football no entregó probabilidades para "
+                        "este encuentro."
                     )
 
                 ganador = pred.get("winner", {}) or {}
@@ -413,91 +454,90 @@ if partidos is not None:
                         f"{ganador['name']}"
                     )
 
-                goles_pred = pred.get("goals", {}) or {}
-                gl_pred = goles_pred.get("home")
-                gv_pred = goles_pred.get("away")
+                goles = pred.get("goals", {}) or {}
+                gl = goles.get("home")
+                gv = goles.get("away")
 
-                if gl_pred is not None or gv_pred is not None:
+                if gl is not None or gv is not None:
                     st.write(
                         f"**Marcador estimado por la API:** "
-                        f"{local.get('name')} "
-                        f"{gl_pred if gl_pred is not None else '?'} - "
-                        f"{gv_pred if gv_pred is not None else '?'} "
+                        f"{local.get('name')} {gl if gl is not None else '?'} "
+                        f"- {gv if gv is not None else '?'} "
                         f"{visita.get('name')}"
                     )
 
                 if pred.get("advice"):
-                    st.info(f"**Pronóstico de la API:** {pred['advice']}")
+                    st.info(f"**Consejo de la API:** {pred['advice']}")
 
                 st.caption(
-                    "Las probabilidades son estimaciones de API-Football, "
-                    "no garantías de resultado."
+                    "Pronósticos orientativos de API-Football; "
+                    "no garantizan el resultado."
                 )
 
                 st.divider()
-                st.header("📈 Últimos cinco partidos")
+                st.header("📈 Rendimiento reciente")
 
                 col_local, col_visita = st.columns(2)
 
-                with col_local:
-                    st.subheader(local.get("name", "Local"))
-                    m1, m2, m3 = st.columns(3)
-                    m1.metric("Victorias", forma_local["Victorias"])
-                    m2.metric("Empates", forma_local["Empates"])
-                    m3.metric("Derrotas", forma_local["Derrotas"])
-
-                    st.write(
-                        f"Goles a favor: **{forma_local['Goles a favor']}**"
+                for columna, nombre, resumen, tabla, errores in [
+                    (
+                        col_local,
+                        local.get("name", "Local"),
+                        forma_local,
+                        tabla_local,
+                        errores_local
+                    ),
+                    (
+                        col_visita,
+                        visita.get("name", "Visitante"),
+                        forma_visita,
+                        tabla_visita,
+                        errores_visita
                     )
-                    st.write(
-                        f"Goles en contra: **{forma_local['Goles en contra']}**"
-                    )
+                ]:
+                    with columna:
+                        st.subheader(nombre)
 
-                    if not tabla_local.empty:
-                        st.dataframe(
-                            tabla_local,
-                            hide_index=True,
-                            use_container_width=True
+                        a, b, c = st.columns(3)
+                        a.metric("Victorias", resumen["Victorias"])
+                        b.metric("Empates", resumen["Empates"])
+                        c.metric("Derrotas", resumen["Derrotas"])
+
+                        st.write(
+                            f"Goles a favor: **{resumen['Goles a favor']}**"
                         )
-                    else:
-                        st.info("No hay resultados recientes disponibles.")
-
-                with col_visita:
-                    st.subheader(visita.get("name", "Visitante"))
-                    m1, m2, m3 = st.columns(3)
-                    m1.metric("Victorias", forma_visita["Victorias"])
-                    m2.metric("Empates", forma_visita["Empates"])
-                    m3.metric("Derrotas", forma_visita["Derrotas"])
-
-                    st.write(
-                        f"Goles a favor: **{forma_visita['Goles a favor']}**"
-                    )
-                    st.write(
-                        f"Goles en contra: **{forma_visita['Goles en contra']}**"
-                    )
-
-                    if not tabla_visita.empty:
-                        st.dataframe(
-                            tabla_visita,
-                            hide_index=True,
-                            use_container_width=True
+                        st.write(
+                            f"Goles en contra: **{resumen['Goles en contra']}**"
                         )
-                    else:
-                        st.info("No hay resultados recientes disponibles.")
+
+                        if not tabla.empty:
+                            st.dataframe(
+                                tabla,
+                                hide_index=True,
+                                use_container_width=True
+                            )
+                        else:
+                            st.warning(
+                                "No se encontraron partidos recientes "
+                                "en las temporadas consultadas."
+                            )
+
+                        if errores:
+                            st.caption(
+                                "Aviso de consulta de temporadas: "
+                                + "; ".join(errores)
+                            )
 
             except requests.HTTPError as e:
-                st.error(
-                    f"Error HTTP durante el análisis: {e}. "
-                    "Puede ser un límite de la API o un endpoint no disponible."
-                )
+                st.error(f"Error HTTP durante el análisis: {e}")
             except requests.RequestException as e:
-                st.error(f"Error de conexión durante el análisis: {e}")
+                st.error(f"Problema de conexión durante el análisis: {e}")
             except Exception as e:
                 st.error(f"No se pudo completar el análisis: {e}")
 
+
 st.divider()
 st.caption(
-    "CanchaLab IA · Datos sujetos a la cobertura de API-Football. "
-    "El análisis estadístico no garantiza resultados deportivos."
+    "CanchaLab IA · La cobertura depende de API-Football. "
+    "Las estadísticas y los pronósticos no aseguran resultados."
 )
-
