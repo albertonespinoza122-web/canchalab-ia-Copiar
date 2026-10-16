@@ -179,9 +179,9 @@ if st.session_state.get("buscar_partidos", False):
             partidos = api_get(
                 "fixtures",
                 {
-                    "from": fecha_inicio.isoformat(),
-                    "to": fecha_fin.isoformat(),
-                    "timezone": TIMEZONE
+                    "from": fecha_inicio.strftime("%Y-%m-%d"),
+"to": fecha_fin.strftime("%Y-%m-%d"),
+"timezone": "America/Santiago"
                 },
                 API_KEY
             )
