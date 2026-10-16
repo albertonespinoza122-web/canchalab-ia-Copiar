@@ -63,15 +63,19 @@ def porcentaje(valor):
 
 
 def obtener_forma(team_id, team_name):
-    partidos = api_get(
+  
+partidos = []
+
+for i in range((fecha_fin - fecha_inicio).days + 1):
+    dia = fecha_inicio + timedelta(days=i)
+
+    resultados_dia = api_get(
         "fixtures",
-        {
-            "team": team_id,
-            "last": 5,
-            "timezone": TIMEZONE
-        },
+        {"date": dia.isoformat()},
         API_KEY
     )
+
+    partidos.extend(resultados_dia)
 
     jugados = []
 
