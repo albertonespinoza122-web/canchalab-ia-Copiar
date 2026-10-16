@@ -16,7 +16,7 @@ st.set_page_config(
     layout="wide",
 )
 
-BASE_URL = "https://www.matchgrind.space/get/soccer"
+BASE_URL = "https://matchgrind.space/get/soccer"
 TIMEOUT = 20
 
 st.markdown(
